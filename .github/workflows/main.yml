@@ -18,8 +18,8 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "SecurityLayer" -Value 0 -Force
 
-          netsh advfirewall firewall delete rule name="RDP-Playit"
-          netsh advfirewall firewall add rule name="RDP-Playit" `
+          netsh advfirewall firewall delete rule name="RDP-Bore"
+          netsh advfirewall firewall add rule name="RDP-Bore" `
             dir=in action=allow protocol=TCP localport=3389
 
           Restart-Service -Name TermService -Force
@@ -54,107 +54,88 @@ jobs:
           }
           Write-Host "RDP user created successfully"
 
-      - name: Install playit.gg
+      - name: Install bore
         run: |
-          Write-Host "Downloading playit.gg agent..."
+          Write-Host "Downloading bore..."
           Invoke-WebRequest `
-            -Uri "https://github.com/playit-cloud/playit-agent/releases/latest/download/playit-windows-x86_64-signed.exe" `
-            -OutFile "C:\playit.exe"
-          Write-Host "playit.gg downloaded successfully"
+            -Uri "https://github.com/ekzhang/bore/releases/latest/download/bore-v0.5.0-x86_64-pc-windows-msvc.zip" `
+            -OutFile "C:\bore.zip"
+          Expand-Archive -Path "C:\bore.zip" -DestinationPath "C:\bore-extracted" -Force
+          Move-Item "C:\bore-extracted\bore.exe" "C:\bore.exe" -Force
+          Remove-Item "C:\bore.zip" -Force
+          Write-Host "bore installed successfully"
+          & "C:\bore.exe" --version
 
-      - name: Start playit.gg and Get Claim URL
+      - name: Start bore Tunnel
         run: |
-          $process = Start-Process -FilePath "C:\playit.exe" `
+          $process = Start-Process -FilePath "C:\bore.exe" `
+            -ArgumentList "local 3389 --to bore.pub" `
             -WindowStyle Hidden `
-            -RedirectStandardOutput "C:\playit-log.txt" `
-            -RedirectStandardError "C:\playit-err.txt" `
+            -RedirectStandardOutput "C:\bore-log.txt" `
+            -RedirectStandardError "C:\bore-err.txt" `
             -PassThru
 
-          Write-Host "playit.gg PID: $($process.Id)"
+          Write-Host "bore PID: $($process.Id)"
 
-          # Wait for claim URL to appear in logs
-          $claimUrl = $null
           $tunnel = $null
           $retries = 0
-          $maxRetries = 60
+          $maxRetries = 20
 
-          while ($retries -lt $maxRetries) {
-              Start-Sleep -Seconds 5
+          while (-not $tunnel -and $retries -lt $maxRetries) {
+              Start-Sleep -Seconds 3
               $retries++
+              Write-Host "Attempt $retries/$maxRetries - Waiting for tunnel..."
 
               if ($process.HasExited) {
-                  Write-Host "--- STDOUT ---"
-                  if (Test-Path "C:\playit-log.txt") { Get-Content "C:\playit-log.txt" }
-                  Write-Host "--- STDERR ---"
-                  if (Test-Path "C:\playit-err.txt") { Get-Content "C:\playit-err.txt" }
-                  Write-Error "playit.gg exited unexpectedly"
+                  Write-Host "--- bore STDOUT ---"
+                  if (Test-Path "C:\bore-log.txt") { Get-Content "C:\bore-log.txt" }
+                  Write-Host "--- bore STDERR ---"
+                  if (Test-Path "C:\bore-err.txt") { Get-Content "C:\bore-err.txt" }
+                  Write-Error "bore exited unexpectedly with code $($process.ExitCode)"
                   exit 1
               }
 
-              $logFiles = @("C:\playit-log.txt", "C:\playit-err.txt")
+              $logFiles = @("C:\bore-log.txt", "C:\bore-err.txt")
               foreach ($logFile in $logFiles) {
                   if (Test-Path $logFile) {
                       $logContent = Get-Content $logFile -Raw
-
-                      # Print all logs every attempt so you can see claim URL
-                      Write-Host "--- Log (Attempt $retries/$maxRetries) ---"
+                      Write-Host "--- Log ---"
                       Write-Host $logContent
 
-                      # Look for claim URL
-                      if (-not $claimUrl -and $logContent -match "(https://playit\.gg/claim/[a-zA-Z0-9\-]+)") {
-                          $claimUrl = $matches[1]
-                          Write-Host ""
-                          Write-Host "========================================="
-                          Write-Host "CLAIM URL FOUND - OPEN THIS IN BROWSER:"
-                          Write-Host "$claimUrl"
-                          Write-Host "========================================="
-                          Write-Host ""
-                      }
-
-                      # Look for tunnel address after claiming
-                      if ($logContent -match "(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+)") {
-                          $tunnel = $matches[1]
-                          Write-Host "Tunnel IP found: $tunnel"
-                          break
-                      }
-                      if ($logContent -match "([a-z0-9\-]+\.ply\.gg:\d+)") {
-                          $tunnel = $matches[1]
-                          Write-Host "Tunnel found: $tunnel"
-                          break
-                      }
-                      if ($logContent -match "([a-z0-9\-]+\.playit\.gg:\d+)") {
-                          $tunnel = $matches[1]
+                      # bore prints: "listening at bore.pub:PORT"
+                      if ($logContent -match "listening at bore\.pub:(\d+)") {
+                          $port = $matches[1]
+                          $tunnel = "bore.pub:$port"
                           Write-Host "Tunnel found: $tunnel"
                           break
                       }
                   }
               }
-
-              if ($tunnel) { break }
           }
 
           if (-not $tunnel) {
-              Write-Error "Tunnel not established. Did you open the claim URL and add a TCP tunnel for port 3389?"
+              Write-Host "--- Final bore STDOUT ---"
+              if (Test-Path "C:\bore-log.txt") { Get-Content "C:\bore-log.txt" }
+              Write-Host "--- Final bore STDERR ---"
+              if (Test-Path "C:\bore-err.txt") { Get-Content "C:\bore-err.txt" }
+              Write-Error "bore tunnel not established after $maxRetries attempts."
               exit 1
           }
 
-          $playitHost = $tunnel.Split(":")[0]
-          $playitPort = $tunnel.Split(":")[1]
+          $boreHost = $tunnel.Split(":")[0]
+          $borePort = $tunnel.Split(":")[1]
 
-          echo "PLAYIT_HOST=$playitHost" >> $env:GITHUB_ENV
-          echo "PLAYIT_PORT=$playitPort" >> $env:GITHUB_ENV
+          echo "BORE_HOST=$boreHost" >> $env:GITHUB_ENV
+          echo "BORE_PORT=$borePort" >> $env:GITHUB_ENV
 
       - name: Maintain Connection
         run: |
           Write-Host "`n=== RDP ACCESS DETAILS ==="
-          Write-Host "Address:  $env:PLAYIT_HOST"
-          Write-Host "Port:     $env:PLAYIT_PORT"
+          Write-Host "Address:  $env:BORE_HOST"
+          Write-Host "Port:     $env:BORE_PORT"
           Write-Host "Username: RDP"
           Write-Host "Password: $env:RDP_PASSWORD"
-          Write-Host "=========================="
-          Write-Host ""
-          Write-Host "Open RDP and connect to:"
-          Write-Host "$env:PLAYIT_HOST`:$env:PLAYIT_PORT"
+          Write-Host "Connect:  bore.pub:$env:BORE_PORT"
           Write-Host "=========================="
 
           while ($true) {
