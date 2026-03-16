@@ -58,11 +58,12 @@ jobs:
         run: |
           Write-Host "Downloading LocaltoNet..."
           Invoke-WebRequest `
-            -Uri "https://localtonet.com/download/localtonet-win-x64.zip" `
+            -Uri "https://localtonet.com/download/localtonet-win-64.zip" `
             -OutFile "C:\localtonet.zip"
           Expand-Archive -Path "C:\localtonet.zip" -DestinationPath "C:\localtonet" -Force
           Remove-Item "C:\localtonet.zip" -Force
-          Write-Host "LocaltoNet installed"
+          Write-Host "Files extracted:"
+          Get-ChildItem "C:\localtonet"
           & "C:\localtonet\localtonet.exe" --version
 
       - name: Start LocaltoNet Tunnel
