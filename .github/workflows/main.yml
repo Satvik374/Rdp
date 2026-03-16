@@ -67,9 +67,7 @@ jobs:
         shell: powershell
         run: |
           Write-Host "Downloading LocaltoNet..."
-          Invoke-WebRequest `
-            -Uri "https://localtonet.com/download/localtonet-win-64.zip" `
-            -OutFile "C:\localtonet.zip"
+          curl.exe -L -o "C:\localtonet.zip" "https://localtonet.com/download/localtonet-win-64.zip"
 
           Write-Host "Extracting..."
           Expand-Archive -Path "C:\localtonet.zip" -DestinationPath "C:\localtonet" -Force
@@ -86,10 +84,9 @@ jobs:
           }
 
           Write-Host "Found exe at: $($exe.FullName)"
-          # Copy to root for easy access
           Copy-Item $exe.FullName "C:\localtonet.exe" -Force
           Write-Host "LocaltoNet installed successfully"
-
+          
       - name: Start LocaltoNet Tunnel
         shell: powershell
         run: |
