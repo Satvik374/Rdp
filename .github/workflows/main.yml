@@ -62,7 +62,7 @@ jobs:
       - name: Establish Cloudflare Tunnel
         run: |
           $process = Start-Process -FilePath "C:\cloudflared.exe" `
-            -ArgumentList "tunnel --url tcp://localhost:3389 --no-autoupdate" `
+            -ArgumentList "tunnel --url http://localhost:3389 --no-autoupdate" `
             -WindowStyle Hidden `
             -RedirectStandardOutput "C:\cf-log.txt" `
             -RedirectStandardError "C:\cf-err.txt" `
@@ -84,13 +84,12 @@ jobs:
                   if (Test-Path "C:\cf-log.txt") { Get-Content "C:\cf-log.txt" }
                   Write-Host "--- CF STDERR ---"
                   if (Test-Path "C:\cf-err.txt") { Get-Content "C:\cf-err.txt" }
-                  Write-Error "Cloudflared exited unexpectedly with code $($process.ExitCode)"
+                  Write-Error "Cloudflared exited unexpectedly"
                   exit 1
               }
 
               if (Test-Path "C:\cf-err.txt") {
                   $logContent = Get-Content "C:\cf-err.txt" -Raw
-                  # Print logs every 5 attempts
                   if ($retries % 5 -eq 0) {
                       Write-Host "--- CF Log Snapshot ---"
                       Write-Host $logContent
