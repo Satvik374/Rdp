@@ -54,95 +54,65 @@ jobs:
           }
           Write-Host "RDP user created successfully"
 
-      - name: Install LocaltoNet
+      - name: Start LocaltoNet Zero-Install SSH Tunnel
         run: |
-          Write-Host "Downloading LocaltoNet..."
-          Invoke-WebRequest `
-            -Uri "https://localtonet.com/download/localtonet-win-64.zip" `
-            -OutFile "C:\localtonet.zip"
-          Expand-Archive -Path "C:\localtonet.zip" -DestinationPath "C:\localtonet" -Force
-          Remove-Item "C:\localtonet.zip" -Force
-          Write-Host "Files extracted:"
-          Get-ChildItem "C:\localtonet"
-          & "C:\localtonet\localtonet.exe" --version
+          # Uses built-in SSH - no download needed
+          # SSH command comes from LocaltoNet dashboard tunnel settings
+          # Format: ssh -p 223 <TunnelToken>@<server>.localto.net -R<RemotePort>:127.0.0.1:3389
 
-      - name: Start LocaltoNet Tunnel
-        run: |
-          # Authenticate first
-          & "C:\localtonet\localtonet.exe" --authtoken ${{ secrets.LOCALTONET_TOKEN }}
-
-          # Start TCP tunnel for RDP
-          $process = Start-Process -FilePath "C:\localtonet\localtonet.exe" `
-            -ArgumentList "--authtoken ${{ secrets.LOCALTONET_TOKEN }}" `
+          $process = Start-Process -FilePath "ssh" `
+            -ArgumentList "-o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -p 223 ${{ secrets.LOCALTONET_TOKEN }}@${{ secrets.LOCALTONET_SERVER }} -R${{ secrets.LOCALTONET_REMOTE_PORT }}:127.0.0.1:3389" `
             -WindowStyle Hidden `
-            -RedirectStandardOutput "C:\ltn-log.txt" `
-            -RedirectStandardError "C:\ltn-err.txt" `
+            -RedirectStandardOutput "C:\tunnel-log.txt" `
+            -RedirectStandardError "C:\tunnel-err.txt" `
             -PassThru
 
-          Write-Host "LocaltoNet PID: $($process.Id)"
+          Write-Host "SSH Tunnel PID: $($process.Id)"
 
-          $tunnel = $null
           $retries = 0
-          $maxRetries = 30
+          $maxRetries = 20
+          $connected = $false
 
-          while (-not $tunnel -and $retries -lt $maxRetries) {
+          while (-not $connected -and $retries -lt $maxRetries) {
               Start-Sleep -Seconds 5
               $retries++
-              Write-Host "Attempt $retries/$maxRetries - Waiting for tunnel..."
+              Write-Host "Attempt $retries/$maxRetries - Checking tunnel..."
 
               if ($process.HasExited) {
                   Write-Host "--- STDOUT ---"
-                  if (Test-Path "C:\ltn-log.txt") { Get-Content "C:\ltn-log.txt" }
+                  if (Test-Path "C:\tunnel-log.txt") { Get-Content "C:\tunnel-log.txt" }
                   Write-Host "--- STDERR ---"
-                  if (Test-Path "C:\ltn-err.txt") { Get-Content "C:\ltn-err.txt" }
-                  Write-Error "LocaltoNet exited unexpectedly"
+                  if (Test-Path "C:\tunnel-err.txt") { Get-Content "C:\tunnel-err.txt" }
+                  Write-Error "SSH tunnel exited unexpectedly"
                   exit 1
               }
 
-              $logFiles = @("C:\ltn-log.txt", "C:\ltn-err.txt")
-              foreach ($logFile in $logFiles) {
-                  if (Test-Path $logFile) {
-                      $logContent = Get-Content $logFile -Raw
-                      Write-Host "--- Log ---"
-                      Write-Host $logContent
-
-                      if ($logContent -match "([a-z0-9\.\-]+\.localtonet\.com):(\d+)") {
-                          $tunnel = "$($matches[1]):$($matches[2])"
-                          Write-Host "Tunnel found: $tunnel"
-                          break
-                      }
-                      if ($logContent -match "(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+)") {
-                          $tunnel = "$($matches[1]):$($matches[2])"
-                          Write-Host "Tunnel found: $tunnel"
-                          break
-                      }
+              if (Test-Path "C:\tunnel-err.txt") {
+                  $log = Get-Content "C:\tunnel-err.txt" -Raw
+                  Write-Host $log
+                  if ($log -match "Allocated port|forwarding|success|connected|Remote forward") {
+                      $connected = $true
+                      Write-Host "Tunnel connected!"
                   }
               }
           }
 
-          if (-not $tunnel) {
+          if (-not $connected) {
               Write-Host "--- Final STDOUT ---"
-              if (Test-Path "C:\ltn-log.txt") { Get-Content "C:\ltn-log.txt" }
+              if (Test-Path "C:\tunnel-log.txt") { Get-Content "C:\tunnel-log.txt" }
               Write-Host "--- Final STDERR ---"
-              if (Test-Path "C:\ltn-err.txt") { Get-Content "C:\ltn-err.txt" }
-              Write-Error "LocaltoNet tunnel not established after $maxRetries attempts."
-              exit 1
+              if (Test-Path "C:\tunnel-err.txt") { Get-Content "C:\tunnel-err.txt" }
+              Write-Host "Tunnel may still be running - check logs above"
           }
-
-          $tunnelHost = $tunnel.Split(":")[0]
-          $tunnelPort = $tunnel.Split(":")[1]
-
-          echo "TUNNEL_HOST=$tunnelHost" >> $env:GITHUB_ENV
-          echo "TUNNEL_PORT=$tunnelPort" >> $env:GITHUB_ENV
 
       - name: Maintain Connection
         run: |
           Write-Host "`n=== RDP ACCESS DETAILS ==="
-          Write-Host "Address:  $env:TUNNEL_HOST"
-          Write-Host "Port:     $env:TUNNEL_PORT"
+          Write-Host "Address:  ${{ secrets.LOCALTONET_SERVER }}"
+          Write-Host "Port:     ${{ secrets.LOCALTONET_REMOTE_PORT }}"
           Write-Host "Username: RDP"
           Write-Host "Password: $env:RDP_PASSWORD"
-          Write-Host "Connect:  $env:TUNNEL_HOST`:$env:TUNNEL_PORT"
+          Write-Host "Connect:  ${{ secrets.LOCALTONET_SERVER }}:${{ secrets.LOCALTONET_REMOTE_PORT }}"
           Write-Host "=========================="
 
           while ($true) {
