@@ -68,17 +68,52 @@ jobs:
           # Authenticate ngrok with auth token
           & "C:\ngrok.exe" config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
 
-          # Start ngrok tunnel for RDP in the background
-          $ngrokProcess = Start-Process -FilePath "C:\ngrok.exe" `
-            -ArgumentList "tcp 3389 --log=stdout --log-level=debug" `
-            -WindowStyle Hidden `
-            -RedirectStandardOutput "C:\ngrok-log.txt" `
-            -RedirectStandardError "C:\ngrok-err.txt" `
-            -PassThru
+          # Run ngrok directly first to see the actual error
+          Write-Host "=== Testing ngrok directly ==="
+          $testOutput = & "C:\ngrok.exe" tcp 3389 --log=stdout 2>&1 &
+          Start-Sleep -Seconds 5
+          Write-Host $testOutput
 
-          Write-Host "Ngrok PID: $($ngrokProcess.Id)"
+          # Check ngrok version and config
+          Write-Host "=== Ngrok Version ==="
+          & "C:\ngrok.exe" version
 
-          # Wait for ngrok API to become available (retry loop)
+          Write-Host "=== Ngrok Config ==="
+          & "C:\ngrok.exe" config check
+
+          # Start ngrok and capture output
+          $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+          $pinfo.FileName = "C:\ngrok.exe"
+          $pinfo.Arguments = "tcp 3389 --log=stdout --log-level=debug"
+          $pinfo.RedirectStandardOutput = $true
+          $pinfo.RedirectStandardError = $true
+          $pinfo.UseShellExecute = $false
+          $pinfo.CreateNoWindow = $true
+
+          $process = New-Object System.Diagnostics.Process
+          $process.StartInfo = $pinfo
+          $process.Start() | Out-Null
+
+          Write-Host "Ngrok PID: $($process.Id)"
+
+          # Wait a bit and capture output
+          Start-Sleep -Seconds 10
+
+          $stdout = $process.StandardOutput.ReadToEnd()
+          $stderr = $process.StandardError.ReadToEnd()
+
+          Write-Host "=== STDOUT ==="
+          Write-Host $stdout
+          Write-Host "=== STDERR ==="
+          Write-Host $stderr
+          Write-Host "=== Exit Code: $($process.ExitCode) ==="
+
+          if ($process.HasExited) {
+              Write-Error "Ngrok crashed. See logs above."
+              exit 1
+          }
+
+          # If still running, query the API
           $tunnel = $null
           $retries = 0
           $maxRetries = 40
@@ -88,21 +123,14 @@ jobs:
               $retries++
               Write-Host "Attempt $retries/$maxRetries - Checking ngrok API..."
 
-              # Print logs every 5 attempts to help debug
-              if ($retries % 5 -eq 0) {
-                  Write-Host "--- ngrok stdout ---"
-                  if (Test-Path "C:\ngrok-log.txt") { Get-Content "C:\ngrok-log.txt" | Select-Object -Last 20 }
-                  Write-Host "--- ngrok stderr ---"
-                  if (Test-Path "C:\ngrok-err.txt") { Get-Content "C:\ngrok-err.txt" | Select-Object -Last 20 }
-              }
-
-              # Check if process is still running
-              if ($ngrokProcess.HasExited) {
-                  Write-Error "Ngrok process exited unexpectedly with code $($ngrokProcess.ExitCode)"
-                  Write-Host "--- Final ngrok stdout ---"
-                  if (Test-Path "C:\ngrok-log.txt") { Get-Content "C:\ngrok-log.txt" }
-                  Write-Host "--- Final ngrok stderr ---"
-                  if (Test-Path "C:\ngrok-err.txt") { Get-Content "C:\ngrok-err.txt" }
+              if ($process.HasExited) {
+                  $stdout = $process.StandardOutput.ReadToEnd()
+                  $stderr = $process.StandardError.ReadToEnd()
+                  Write-Host "=== STDOUT ==="
+                  Write-Host $stdout
+                  Write-Host "=== STDERR ==="
+                  Write-Host $stderr
+                  Write-Error "Ngrok exited with code $($process.ExitCode)"
                   exit 1
               }
 
@@ -120,15 +148,10 @@ jobs:
           }
 
           if (-not $tunnel) {
-              Write-Host "--- Final ngrok stdout ---"
-              if (Test-Path "C:\ngrok-log.txt") { Get-Content "C:\ngrok-log.txt" }
-              Write-Host "--- Final ngrok stderr ---"
-              if (Test-Path "C:\ngrok-err.txt") { Get-Content "C:\ngrok-err.txt" }
               Write-Error "Ngrok tunnel not established after $maxRetries attempts."
               exit 1
           }
 
-          # Parse host and port from tcp://X.X.X.X:PORT
           $parsed = $tunnel -replace "tcp://", ""
           $ngrokHost = $parsed.Split(":")[0]
           $ngrokPort = $parsed.Split(":")[1]
@@ -136,7 +159,7 @@ jobs:
           Write-Host "Tunnel established: $tunnel"
           echo "NGROK_HOST=$ngrokHost" >> $env:GITHUB_ENV
           echo "NGROK_PORT=$ngrokPort" >> $env:GITHUB_ENV
-
+          
       - name: Verify RDP Accessibility
         run: |
           Write-Host "Ngrok Host: $env:NGROK_HOST"
