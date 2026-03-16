@@ -62,23 +62,9 @@ jobs:
             -OutFile "C:\playit.exe"
           Write-Host "playit.gg downloaded successfully"
 
-      - name: Configure playit.gg
-        run: |
-          # Create playit config directory
-          New-Item -ItemType Directory -Force -Path "C:\playit-config" | Out-Null
-
-          # Write playit config file with secret key from GitHub secrets
-          $config = @"
-          last_update: 0
-          secret_key: ${{ secrets.PLAYIT_SECRET }}
-          "@
-          Set-Content -Path "C:\playit-config\config.toml" -Value $config
-          Write-Host "playit.gg config written"
-
-      - name: Start playit.gg Tunnel
+      - name: Start playit.gg and Get Claim URL
         run: |
           $process = Start-Process -FilePath "C:\playit.exe" `
-            -ArgumentList "--config C:\playit-config\config.toml" `
             -WindowStyle Hidden `
             -RedirectStandardOutput "C:\playit-log.txt" `
             -RedirectStandardError "C:\playit-err.txt" `
@@ -86,63 +72,69 @@ jobs:
 
           Write-Host "playit.gg PID: $($process.Id)"
 
+          # Wait for claim URL to appear in logs
+          $claimUrl = $null
           $tunnel = $null
           $retries = 0
-          $maxRetries = 40
+          $maxRetries = 60
 
-          while (-not $tunnel -and $retries -lt $maxRetries) {
+          while ($retries -lt $maxRetries) {
               Start-Sleep -Seconds 5
               $retries++
-              Write-Host "Attempt $retries/$maxRetries - Waiting for tunnel..."
 
-              # Check if process crashed
               if ($process.HasExited) {
-                  Write-Host "--- playit STDOUT ---"
+                  Write-Host "--- STDOUT ---"
                   if (Test-Path "C:\playit-log.txt") { Get-Content "C:\playit-log.txt" }
-                  Write-Host "--- playit STDERR ---"
+                  Write-Host "--- STDERR ---"
                   if (Test-Path "C:\playit-err.txt") { Get-Content "C:\playit-err.txt" }
-                  Write-Error "playit.gg exited unexpectedly with code $($process.ExitCode)"
+                  Write-Error "playit.gg exited unexpectedly"
                   exit 1
               }
 
-              # Print logs every 5 attempts
-              if ($retries % 5 -eq 0) {
-                  Write-Host "--- playit log snapshot ---"
-                  if (Test-Path "C:\playit-log.txt") { Get-Content "C:\playit-log.txt" | Select-Object -Last 20 }
-                  if (Test-Path "C:\playit-err.txt") { Get-Content "C:\playit-err.txt" | Select-Object -Last 20 }
-              }
-
-              # Check logs for tunnel address
               $logFiles = @("C:\playit-log.txt", "C:\playit-err.txt")
               foreach ($logFile in $logFiles) {
                   if (Test-Path $logFile) {
                       $logContent = Get-Content $logFile -Raw
-                      # Match patterns like: 147.185.221.x:PORT or *.joinmc.link:PORT
+
+                      # Print all logs every attempt so you can see claim URL
+                      Write-Host "--- Log (Attempt $retries/$maxRetries) ---"
+                      Write-Host $logContent
+
+                      # Look for claim URL
+                      if (-not $claimUrl -and $logContent -match "(https://playit\.gg/claim/[a-zA-Z0-9\-]+)") {
+                          $claimUrl = $matches[1]
+                          Write-Host ""
+                          Write-Host "========================================="
+                          Write-Host "CLAIM URL FOUND - OPEN THIS IN BROWSER:"
+                          Write-Host "$claimUrl"
+                          Write-Host "========================================="
+                          Write-Host ""
+                      }
+
+                      # Look for tunnel address after claiming
                       if ($logContent -match "(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+)") {
                           $tunnel = $matches[1]
                           Write-Host "Tunnel IP found: $tunnel"
                           break
                       }
-                      if ($logContent -match "([a-z0-9\-]+\.joinmc\.link:\d+)") {
+                      if ($logContent -match "([a-z0-9\-]+\.ply\.gg:\d+)") {
                           $tunnel = $matches[1]
-                          Write-Host "Tunnel hostname found: $tunnel"
+                          Write-Host "Tunnel found: $tunnel"
                           break
                       }
                       if ($logContent -match "([a-z0-9\-]+\.playit\.gg:\d+)") {
                           $tunnel = $matches[1]
-                          Write-Host "Tunnel hostname found: $tunnel"
+                          Write-Host "Tunnel found: $tunnel"
                           break
                       }
                   }
               }
+
+              if ($tunnel) { break }
           }
 
           if (-not $tunnel) {
-              Write-Host "--- Final playit STDOUT ---"
-              if (Test-Path "C:\playit-log.txt") { Get-Content "C:\playit-log.txt" }
-              Write-Host "--- Final playit STDERR ---"
-              if (Test-Path "C:\playit-err.txt") { Get-Content "C:\playit-err.txt" }
-              Write-Error "playit.gg tunnel not established after $maxRetries attempts."
+              Write-Error "Tunnel not established. Did you open the claim URL and add a TCP tunnel for port 3389?"
               exit 1
           }
 
