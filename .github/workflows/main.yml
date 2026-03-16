@@ -69,30 +69,62 @@ jobs:
           & "C:\ngrok.exe" config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
 
           # Start ngrok tunnel for RDP in the background
-          Start-Process -FilePath "C:\ngrok.exe" `
-            -ArgumentList "tcp 3389" `
-            -WindowStyle Hidden
+          $ngrokProcess = Start-Process -FilePath "C:\ngrok.exe" `
+            -ArgumentList "tcp 3389 --log=stdout --log-level=debug" `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput "C:\ngrok-log.txt" `
+            -RedirectStandardError "C:\ngrok-err.txt" `
+            -PassThru
+
+          Write-Host "Ngrok PID: $($ngrokProcess.Id)"
 
           # Wait for ngrok API to become available (retry loop)
           $tunnel = $null
           $retries = 0
-          $maxRetries = 20
+          $maxRetries = 40
 
           while (-not $tunnel -and $retries -lt $maxRetries) {
-              Start-Sleep -Seconds 3
+              Start-Sleep -Seconds 5
+              $retries++
+              Write-Host "Attempt $retries/$maxRetries - Checking ngrok API..."
+
+              # Print logs every 5 attempts to help debug
+              if ($retries % 5 -eq 0) {
+                  Write-Host "--- ngrok stdout ---"
+                  if (Test-Path "C:\ngrok-log.txt") { Get-Content "C:\ngrok-log.txt" | Select-Object -Last 20 }
+                  Write-Host "--- ngrok stderr ---"
+                  if (Test-Path "C:\ngrok-err.txt") { Get-Content "C:\ngrok-err.txt" | Select-Object -Last 20 }
+              }
+
+              # Check if process is still running
+              if ($ngrokProcess.HasExited) {
+                  Write-Error "Ngrok process exited unexpectedly with code $($ngrokProcess.ExitCode)"
+                  Write-Host "--- Final ngrok stdout ---"
+                  if (Test-Path "C:\ngrok-log.txt") { Get-Content "C:\ngrok-log.txt" }
+                  Write-Host "--- Final ngrok stderr ---"
+                  if (Test-Path "C:\ngrok-err.txt") { Get-Content "C:\ngrok-err.txt" }
+                  exit 1
+              }
+
               try {
                   $tunnelInfo = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -ErrorAction Stop
                   if ($tunnelInfo.tunnels.Count -gt 0) {
                       $tunnel = $tunnelInfo.tunnels[0].public_url
+                      Write-Host "Tunnel found: $tunnel"
+                  } else {
+                      Write-Host "API reachable but no tunnels yet..."
                   }
               } catch {
-                  Write-Host "Attempt $($retries + 1)/$maxRetries - Waiting for ngrok to start..."
+                  Write-Host "API not ready: $($_.Exception.Message)"
               }
-              $retries++
           }
 
           if (-not $tunnel) {
-              Write-Error "Ngrok tunnel not established after $maxRetries attempts. Exiting."
+              Write-Host "--- Final ngrok stdout ---"
+              if (Test-Path "C:\ngrok-log.txt") { Get-Content "C:\ngrok-log.txt" }
+              Write-Host "--- Final ngrok stderr ---"
+              if (Test-Path "C:\ngrok-err.txt") { Get-Content "C:\ngrok-err.txt" }
+              Write-Error "Ngrok tunnel not established after $maxRetries attempts."
               exit 1
           }
 
