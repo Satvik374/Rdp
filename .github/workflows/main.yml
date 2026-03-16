@@ -1,82 +1,137 @@
-name: Ubuntu RDP Tunnel
+name: RDP
 
 on:
   workflow_dispatch:
 
 jobs:
-  rdp-access:
-    runs-on: ubuntu-latest
+  secure-rdp:
+    runs-on: windows-latest
     timeout-minutes: 3600
 
     steps:
-      - name: Install XRDP and XFCE Desktop
+      - name: Configure Core RDP Settings
+        shell: powershell
         run: |
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            xrdp xfce4 xfce4-goodies dbus-x11 wget unzip
-          echo xfce4-session > ~/.xsession
-          sudo systemctl enable xrdp
-          sudo systemctl start xrdp
-          sudo ufw allow 3389/tcp || true
-          sudo sed -i 's/^port=3389/port=3389/' /etc/xrdp/xrdp.ini
-          sudo systemctl restart xrdp
-          sudo netstat -tlnp | grep 3389 || echo "XRDP started"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
 
-      - name: Create RDP User
-        run: |
-          password=$(cat /dev/urandom | tr -dc 'A-Za-z0-9@#!' | head -c 16)
-          sudo useradd -m -s /bin/bash rdpuser
-          echo "rdpuser:$password" | sudo chpasswd
-          sudo usermod -aG sudo rdpuser
-          echo "xfce4-session" | sudo tee /home/rdpuser/.xsession
-          sudo chown rdpuser:rdpuser /home/rdpuser/.xsession
-          sudo chmod 755 /home/rdpuser/.xsession
-          echo "RDP_PASSWORD=$password" >> $GITHUB_ENV
-          echo "✓ RDP user created: rdpuser / $password"
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          New-NetFirewallRule `
+            -DisplayName "RDP-Tunnel" `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -Action Allow `
+            -ErrorAction SilentlyContinue
 
-      - name: Start LocaltoNet SSH Tunnel
-        run: |
-          echo "Starting tunnel with LocaltoNet SSH command..."
-          nohup ssh \
-            -o StrictHostKeyChecking=no \
-            -o ServerAliveInterval=30 \
-            -o ServerAliveCountMax=999 \
-            -p 223 \
-            "${{ secrets.LOCALTONET_TOKEN }}@${{ secrets.LOCALTONET_SERVER }}" \
-            -R "${{ secrets.LOCALTONET_REMOTE_PORT }}:127.0.0.1:3389" \
-            -N > tunnel.log 2>&1 &
-          
-          TUNNEL_PID=$!
-          echo "TUNNEL_PID=$TUNNEL_PID" >> $GITHUB_ENV
-          
-          # Wait and verify
-          sleep 10
-          if kill -0 $TUNNEL_PID 2>/dev/null; then
-            echo "✓ Tunnel running (PID: $TUNNEL_PID)"
-            ps aux | grep ssh || true
-          else
-            echo "Tunnel log:"
-            cat tunnel.log
-            exit 1
-          fi
+          Restart-Service -Name TermService -Force
+          Write-Host "RDP configured successfully"
 
-      - name: Show Connection Details & Keep Alive
+      - name: Create RDP User with Secure Password
+        shell: powershell
         run: |
-          echo ""
-          echo "🎯 RDP ACCESS DETAILS 🎯"
-          echo "════════════════════════"
-          echo "Server:  ${{ secrets.LOCALTONET_SERVER }}"
-          echo "Port:    ${{ secrets.LOCALTONET_REMOTE_PORT }}"
-          echo "User:    rdpuser"
-          echo "Pass:    $RDP_PASSWORD"
-          echo ""
-          echo "📱 Connect via:"
-          echo "mstsc /v:${{ secrets.LOCALTONET_SERVER }}:${{ secrets.LOCALTONET_REMOTE_PORT }}"
-          echo "════════════════════════"
-          echo ""
-          
-          # Keep workflow alive
-          while true; do
-            echo "[$(date)] ✅ RDP Active (PID: $TUNNEL_PID)"
-            sleep 300
-          done
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126))
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Set-LocalUser -Name "RDP" -Password $securePass -PasswordNeverExpires $true
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+          Write-Host "RDP user created successfully"
+
+      - name: Download and Install LocaltoNet
+        shell: powershell
+        run: |
+          Write-Host "Downloading LocaltoNet..."
+          Invoke-WebRequest `
+            -Uri "https://localtonet.com/download/localtonet-win-64.zip" `
+            -OutFile "C:\localtonet.zip"
+
+          Write-Host "Extracting..."
+          Expand-Archive -Path "C:\localtonet.zip" -DestinationPath "C:\localtonet" -Force
+          Remove-Item "C:\localtonet.zip" -Force
+
+          Write-Host "Files extracted:"
+          Get-ChildItem "C:\localtonet" -Recurse
+
+          # Find localtonet.exe wherever it extracted
+          $exe = Get-ChildItem -Path "C:\localtonet" -Filter "localtonet.exe" -Recurse | Select-Object -First 1
+          if (-not $exe) {
+              Write-Error "localtonet.exe not found after extraction"
+              exit 1
+          }
+
+          Write-Host "Found exe at: $($exe.FullName)"
+          # Copy to root for easy access
+          Copy-Item $exe.FullName "C:\localtonet.exe" -Force
+          Write-Host "LocaltoNet installed successfully"
+
+      - name: Start LocaltoNet Tunnel
+        shell: powershell
+        run: |
+          # Use exact SSH tunnel command format from LocaltoNet dashboard
+          $process = Start-Process -FilePath "ssh" `
+            -ArgumentList "-o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=999 -p 223 ${{ secrets.LOCALTONET_TOKEN }}@${{ secrets.LOCALTONET_SERVER }} -R ${{ secrets.LOCALTONET_REMOTE_PORT }}:127.0.0.1:3389 -N" `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput "C:\ltn-log.txt" `
+            -RedirectStandardError "C:\ltn-err.txt" `
+            -PassThru
+
+          Write-Host "Tunnel PID: $($process.Id)"
+
+          Write-Host "Waiting 20 seconds for tunnel to establish..."
+          Start-Sleep -Seconds 20
+
+          if ($process.HasExited) {
+              Write-Host "--- STDOUT ---"
+              if (Test-Path "C:\ltn-log.txt") { Get-Content "C:\ltn-log.txt" }
+              Write-Host "--- STDERR ---"
+              if (Test-Path "C:\ltn-err.txt") { Get-Content "C:\ltn-err.txt" }
+              Write-Error "Tunnel exited unexpectedly with code $($process.ExitCode)"
+              exit 1
+          }
+
+          Write-Host "--- Tunnel Log ---"
+          if (Test-Path "C:\ltn-log.txt") { Get-Content "C:\ltn-log.txt" }
+          if (Test-Path "C:\ltn-err.txt") { Get-Content "C:\ltn-err.txt" }
+          Write-Host "Tunnel is running!"
+
+      - name: Maintain Connection
+        shell: powershell
+        run: |
+          Write-Host "`n=== RDP ACCESS DETAILS ==="
+          Write-Host "Address:  ${{ secrets.LOCALTONET_SERVER }}"
+          Write-Host "Port:     ${{ secrets.LOCALTONET_REMOTE_PORT }}"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "Connect:  ${{ secrets.LOCALTONET_SERVER }}:${{ secrets.LOCALTONET_REMOTE_PORT }}"
+          Write-Host "=========================="
+
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Cancel workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
