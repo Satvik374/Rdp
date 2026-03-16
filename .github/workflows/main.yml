@@ -63,16 +63,16 @@ jobs:
           Expand-Archive -Path "C:\localtonet.zip" -DestinationPath "C:\localtonet" -Force
           Remove-Item "C:\localtonet.zip" -Force
           Write-Host "LocaltoNet installed"
-          Get-ChildItem "C:\localtonet"
+          & "C:\localtonet\localtonet.exe" --version
 
       - name: Start LocaltoNet Tunnel
         run: |
-          # Find the exe
-          $exe = Get-ChildItem -Path "C:\localtonet" -Filter "*.exe" -Recurse | Select-Object -First 1
-          Write-Host "Found exe: $($exe.FullName)"
+          # Authenticate first
+          & "C:\localtonet\localtonet.exe" --authtoken ${{ secrets.LOCALTONET_TOKEN }}
 
-          $process = Start-Process -FilePath $exe.FullName `
-            -ArgumentList "-authtoken ${{ secrets.LOCALTONET_TOKEN }} -type tcp -port 3389" `
+          # Start TCP tunnel for RDP
+          $process = Start-Process -FilePath "C:\localtonet\localtonet.exe" `
+            -ArgumentList "--authtoken ${{ secrets.LOCALTONET_TOKEN }}" `
             -WindowStyle Hidden `
             -RedirectStandardOutput "C:\ltn-log.txt" `
             -RedirectStandardError "C:\ltn-err.txt" `
@@ -105,7 +105,7 @@ jobs:
                       Write-Host "--- Log ---"
                       Write-Host $logContent
 
-                      if ($logContent -match "([a-z0-9\.\-]+localtonet\.com):(\d+)") {
+                      if ($logContent -match "([a-z0-9\.\-]+\.localtonet\.com):(\d+)") {
                           $tunnel = "$($matches[1]):$($matches[2])"
                           Write-Host "Tunnel found: $tunnel"
                           break
@@ -120,6 +120,10 @@ jobs:
           }
 
           if (-not $tunnel) {
+              Write-Host "--- Final STDOUT ---"
+              if (Test-Path "C:\ltn-log.txt") { Get-Content "C:\ltn-log.txt" }
+              Write-Host "--- Final STDERR ---"
+              if (Test-Path "C:\ltn-err.txt") { Get-Content "C:\ltn-err.txt" }
               Write-Error "LocaltoNet tunnel not established after $maxRetries attempts."
               exit 1
           }
