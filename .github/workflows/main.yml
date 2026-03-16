@@ -73,15 +73,26 @@ jobs:
             -ArgumentList "tcp 3389" `
             -WindowStyle Hidden
 
-          # Wait for tunnel to initialize
-          Start-Sleep -Seconds 8
+          # Wait for ngrok API to become available (retry loop)
+          $tunnel = $null
+          $retries = 0
+          $maxRetries = 20
 
-          # Retrieve the public tunnel address from the ngrok local API
-          $tunnelInfo = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels"
-          $tunnel = $tunnelInfo.tunnels[0].public_url
+          while (-not $tunnel -and $retries -lt $maxRetries) {
+              Start-Sleep -Seconds 3
+              try {
+                  $tunnelInfo = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -ErrorAction Stop
+                  if ($tunnelInfo.tunnels.Count -gt 0) {
+                      $tunnel = $tunnelInfo.tunnels[0].public_url
+                  }
+              } catch {
+                  Write-Host "Attempt $($retries + 1)/$maxRetries - Waiting for ngrok to start..."
+              }
+              $retries++
+          }
 
           if (-not $tunnel) {
-              Write-Error "Ngrok tunnel not established. Exiting."
+              Write-Error "Ngrok tunnel not established after $maxRetries attempts. Exiting."
               exit 1
           }
 
@@ -90,6 +101,7 @@ jobs:
           $ngrokHost = $parsed.Split(":")[0]
           $ngrokPort = $parsed.Split(":")[1]
 
+          Write-Host "Tunnel established: $tunnel"
           echo "NGROK_HOST=$ngrokHost" >> $env:GITHUB_ENV
           echo "NGROK_PORT=$ngrokPort" >> $env:GITHUB_ENV
 
@@ -108,14 +120,14 @@ jobs:
       - name: Maintain Connection
         run: |
           Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:NGROK_HOST"
-          Write-Host "Port:    $env:NGROK_PORT"
+          Write-Host "Address:  $env:NGROK_HOST"
+          Write-Host "Port:     $env:NGROK_PORT"
           Write-Host "Username: RDP"
           Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "Connect:  $env:NGROK_HOST`:$env:NGROK_PORT"
           Write-Host "==================`n"
-          Write-Host "Connect using: $env:NGROK_HOST`:$env:NGROK_PORT"
 
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Write-Host "[$(Get-Date)] RDP Active - Cancel workflow to terminate"
               Start-Sleep -Seconds 300
           }
