@@ -1,25 +1,26 @@
-name: RDP
+name: Ubuntu RDP Tunnel
 
 on:
   workflow_dispatch:
 
 jobs:
-  secure-rdp:
+  rdp-access:
     runs-on: ubuntu-latest
     timeout-minutes: 3600
 
     steps:
-      - name: Install RDP Server and Desktop
+      - name: Install XRDP and XFCE Desktop
         run: |
-          sudo apt-get update -y
+          sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            xrdp xfce4 xfce4-goodies dbus-x11
+            xrdp xfce4 xfce4-goodies dbus-x11 wget unzip
+          echo xfce4-session > ~/.xsession
           sudo systemctl enable xrdp
           sudo systemctl start xrdp
-          echo xfce4-session | tee ~/.xsession
+          sudo ufw allow 3389/tcp || true
           sudo sed -i 's/^port=3389/port=3389/' /etc/xrdp/xrdp.ini
           sudo systemctl restart xrdp
-          echo "xrdp installed and running"
+          sudo netstat -tlnp | grep 3389 || echo "XRDP started"
 
       - name: Create RDP User
         run: |
@@ -29,55 +30,53 @@ jobs:
           sudo usermod -aG sudo rdpuser
           echo "xfce4-session" | sudo tee /home/rdpuser/.xsession
           sudo chown rdpuser:rdpuser /home/rdpuser/.xsession
+          sudo chmod 755 /home/rdpuser/.xsession
           echo "RDP_PASSWORD=$password" >> $GITHUB_ENV
-          echo "RDP user created successfully"
+          echo "✓ RDP user created: rdpuser / $password"
 
-      - name: Download and Install LocaltoNet
+      - name: Start LocaltoNet SSH Tunnel
         run: |
-          echo "Downloading LocaltoNet for Linux..."
-          curl -L https://localtonet.com/download/localtonet-linux-x64.zip -o localtonet.zip
-          unzip localtonet.zip
-          chmod +x localtonet
-          sudo mv localtonet /usr/local/bin/localtonet
-          localtonet --version
-          echo "LocaltoNet installed successfully"
-
-      - name: Start LocaltoNet Tunnel
-        run: |
-          # Authenticate and start tunnel using SSH command format
-          ssh -o StrictHostKeyChecking=no \
-              -o ServerAliveInterval=30 \
-              -o ServerAliveCountMax=999 \
-              -p 223 \
-              ${{ secrets.LOCALTONET_TOKEN }}@${{ secrets.LOCALTONET_SERVER }} \
-              -R ${{ secrets.LOCALTONET_REMOTE_PORT }}:127.0.0.1:3389 \
-              -N &
-
+          echo "Starting tunnel with LocaltoNet SSH command..."
+          nohup ssh \
+            -o StrictHostKeyChecking=no \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=999 \
+            -p 223 \
+            "${{ secrets.LOCALTONET_TOKEN }}@${{ secrets.LOCALTONET_SERVER }}" \
+            -R "${{ secrets.LOCALTONET_REMOTE_PORT }}:127.0.0.1:3389" \
+            -N > tunnel.log 2>&1 &
+          
           TUNNEL_PID=$!
-          echo "Tunnel PID: $TUNNEL_PID"
-
-          # Wait and verify tunnel is running
-          sleep 15
-
+          echo "TUNNEL_PID=$TUNNEL_PID" >> $GITHUB_ENV
+          
+          # Wait and verify
+          sleep 10
           if kill -0 $TUNNEL_PID 2>/dev/null; then
-              echo "Tunnel is running successfully!"
+            echo "✓ Tunnel running (PID: $TUNNEL_PID)"
+            ps aux | grep ssh || true
           else
-              echo "Tunnel failed to start"
-              exit 1
+            echo "Tunnel log:"
+            cat tunnel.log
+            exit 1
           fi
 
-      - name: Maintain Connection
+      - name: Show Connection Details & Keep Alive
         run: |
           echo ""
-          echo "=== RDP ACCESS DETAILS ==="
-          echo "Address:  ${{ secrets.LOCALTONET_SERVER }}"
-          echo "Port:     ${{ secrets.LOCALTONET_REMOTE_PORT }}"
-          echo "Username: rdpuser"
-          echo "Password: $RDP_PASSWORD"
-          echo "Connect:  ${{ secrets.LOCALTONET_SERVER }}:${{ secrets.LOCALTONET_REMOTE_PORT }}"
-          echo "=========================="
-
+          echo "🎯 RDP ACCESS DETAILS 🎯"
+          echo "════════════════════════"
+          echo "Server:  ${{ secrets.LOCALTONET_SERVER }}"
+          echo "Port:    ${{ secrets.LOCALTONET_REMOTE_PORT }}"
+          echo "User:    rdpuser"
+          echo "Pass:    $RDP_PASSWORD"
+          echo ""
+          echo "📱 Connect via:"
+          echo "mstsc /v:${{ secrets.LOCALTONET_SERVER }}:${{ secrets.LOCALTONET_REMOTE_PORT }}"
+          echo "════════════════════════"
+          echo ""
+          
+          # Keep workflow alive
           while true; do
-              echo "[$(date)] RDP Active - Cancel workflow to terminate"
-              sleep 300
+            echo "[$(date)] ✅ RDP Active (PID: $TUNNEL_PID)"
+            sleep 300
           done
