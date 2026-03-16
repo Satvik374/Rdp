@@ -18,8 +18,8 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "SecurityLayer" -Value 0 -Force
 
-          netsh advfirewall firewall delete rule name="RDP-Ngrok"
-          netsh advfirewall firewall add rule name="RDP-Ngrok" `
+          netsh advfirewall firewall delete rule name="RDP-Cloudflare"
+          netsh advfirewall firewall add rule name="RDP-Cloudflare" `
             dir=in action=allow protocol=TCP localport=3389
 
           Restart-Service -Name TermService -Force
@@ -52,47 +52,50 @@ jobs:
               exit 1
           }
 
-      - name: Install OpenSSH Client
+      - name: Install Cloudflare Tunnel
         run: |
-          Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
+          $url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+          Invoke-WebRequest -Uri $url -OutFile "C:\cloudflared.exe"
+          Write-Host "Cloudflared downloaded successfully"
+          & "C:\cloudflared.exe" --version
 
-      - name: Establish Tunnel via localhost.run
+      - name: Establish Cloudflare Tunnel
         run: |
-          # Start SSH tunnel to localhost.run in background
-          $sshProcess = Start-Process -FilePath "ssh" `
-            -ArgumentList "-o StrictHostKeyChecking=no -o ServerAliveInterval=60 -R 3389:localhost:3389 localhost.run" `
+          $process = Start-Process -FilePath "C:\cloudflared.exe" `
+            -ArgumentList "tunnel --url tcp://localhost:3389 --no-autoupdate" `
             -WindowStyle Hidden `
-            -RedirectStandardOutput "C:\tunnel-log.txt" `
-            -RedirectStandardError "C:\tunnel-err.txt" `
+            -RedirectStandardOutput "C:\cf-log.txt" `
+            -RedirectStandardError "C:\cf-err.txt" `
             -PassThru
 
-          Write-Host "SSH Tunnel PID: $($sshProcess.Id)"
+          Write-Host "Cloudflared PID: $($process.Id)"
 
-          # Wait and parse the assigned address
           $tunnel = $null
           $retries = 0
-          $maxRetries = 20
+          $maxRetries = 30
 
           while (-not $tunnel -and $retries -lt $maxRetries) {
               Start-Sleep -Seconds 5
               $retries++
               Write-Host "Attempt $retries/$maxRetries - Waiting for tunnel..."
 
-              if ($sshProcess.HasExited) {
-                  Write-Host "--- Tunnel Log ---"
-                  if (Test-Path "C:\tunnel-log.txt") { Get-Content "C:\tunnel-log.txt" }
-                  if (Test-Path "C:\tunnel-err.txt") { Get-Content "C:\tunnel-err.txt" }
-                  Write-Error "SSH tunnel exited unexpectedly"
+              if ($process.HasExited) {
+                  Write-Host "--- CF STDOUT ---"
+                  if (Test-Path "C:\cf-log.txt") { Get-Content "C:\cf-log.txt" }
+                  Write-Host "--- CF STDERR ---"
+                  if (Test-Path "C:\cf-err.txt") { Get-Content "C:\cf-err.txt" }
+                  Write-Error "Cloudflared exited unexpectedly with code $($process.ExitCode)"
                   exit 1
               }
 
-              if (Test-Path "C:\tunnel-err.txt") {
-                  $logContent = Get-Content "C:\tunnel-err.txt" -Raw
-                  Write-Host $logContent
-
-                  # localhost.run prints something like: "tunneled with tls termination, https://xxxxx.localhost.run"
-                  # For TCP it prints the address directly
-                  if ($logContent -match "([a-z0-9]+\.lhr\.life:\d+)") {
+              if (Test-Path "C:\cf-err.txt") {
+                  $logContent = Get-Content "C:\cf-err.txt" -Raw
+                  # Print logs every 5 attempts
+                  if ($retries % 5 -eq 0) {
+                      Write-Host "--- CF Log Snapshot ---"
+                      Write-Host $logContent
+                  }
+                  if ($logContent -match "(https://[a-z0-9\-]+\.trycloudflare\.com)") {
                       $tunnel = $matches[1]
                       Write-Host "Tunnel found: $tunnel"
                   }
@@ -100,42 +103,35 @@ jobs:
           }
 
           if (-not $tunnel) {
-              Write-Host "--- Tunnel Log ---"
-              if (Test-Path "C:\tunnel-log.txt") { Get-Content "C:\tunnel-log.txt" }
-              if (Test-Path "C:\tunnel-err.txt") { Get-Content "C:\tunnel-err.txt" }
-              Write-Error "Tunnel not established after $maxRetries attempts."
+              Write-Host "--- Final CF STDOUT ---"
+              if (Test-Path "C:\cf-log.txt") { Get-Content "C:\cf-log.txt" }
+              Write-Host "--- Final CF STDERR ---"
+              if (Test-Path "C:\cf-err.txt") { Get-Content "C:\cf-err.txt" }
+              Write-Error "Cloudflare tunnel not established after $maxRetries attempts."
               exit 1
           }
 
-          $ngrokHost = $tunnel.Split(":")[0]
-          $ngrokPort = $tunnel.Split(":")[1]
+          echo "CF_TUNNEL=$tunnel" >> $env:GITHUB_ENV
 
-          Write-Host "Host: $ngrokHost"
-          Write-Host "Port: $ngrokPort"
-          echo "NGROK_HOST=$ngrokHost" >> $env:GITHUB_ENV
-          echo "NGROK_PORT=$ngrokPort" >> $env:GITHUB_ENV
-          
-      - name: Verify RDP Accessibility
+      - name: Install Cloudflare WARP / cloudflared on Runner for RDP Client
         run: |
-          Write-Host "Ngrok Host: $env:NGROK_HOST"
-          Write-Host "Ngrok Port: $env:NGROK_PORT"
-
-          $testResult = Test-NetConnection -ComputerName $env:NGROK_HOST -Port $env:NGROK_PORT
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port failed via ngrok"
-              exit 1
-          }
-          Write-Host "TCP connectivity successful!"
+          Write-Host "Tunnel is ready for external RDP access"
+          Write-Host "You will need cloudflared on YOUR machine to connect"
 
       - name: Maintain Connection
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address:  $env:NGROK_HOST"
-          Write-Host "Port:     $env:NGROK_PORT"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $env:RDP_PASSWORD"
-          Write-Host "Connect:  $env:NGROK_HOST`:$env:NGROK_PORT"
-          Write-Host "==================`n"
+          Write-Host "`n=== RDP ACCESS DETAILS ==="
+          Write-Host "Tunnel URL: $env:CF_TUNNEL"
+          Write-Host "Username:   RDP"
+          Write-Host "Password:   $env:RDP_PASSWORD"
+          Write-Host "=========================="
+          Write-Host ""
+          Write-Host "To connect, run this on YOUR machine first:"
+          Write-Host "cloudflared access tcp --hostname $env:CF_TUNNEL --url localhost:13389"
+          Write-Host ""
+          Write-Host "Then open RDP client and connect to:"
+          Write-Host "localhost:13389"
+          Write-Host "=========================="
 
           while ($true) {
               Write-Host "[$(Get-Date)] RDP Active - Cancel workflow to terminate"
