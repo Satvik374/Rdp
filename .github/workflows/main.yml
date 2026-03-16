@@ -10,6 +10,7 @@ jobs:
 
     steps:
       - name: Configure Core RDP Settings
+        shell: powershell
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                              -Name "fDenyTSConnections" -Value 0 -Force
@@ -18,14 +19,21 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "SecurityLayer" -Value 0 -Force
 
-          netsh advfirewall firewall delete rule name="RDP-Tunnel"
-          netsh advfirewall firewall add rule name="RDP-Tunnel" `
-            dir=in action=allow protocol=TCP localport=3389
+          # Fix 3 - Use PowerShell firewall instead of netsh
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          New-NetFirewallRule `
+            -DisplayName "RDP-Tunnel" `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -Action Allow `
+            -ErrorAction SilentlyContinue
 
           Restart-Service -Name TermService -Force
           Write-Host "RDP configured successfully"
 
       - name: Create RDP User with Secure Password
+        shell: powershell
         run: |
           Add-Type -AssemblyName System.Security
           $charSet = @{
@@ -42,7 +50,12 @@ jobs:
           $rawPassword += $charSet.Special | Get-Random -Count 4
           $password = -join ($rawPassword | Sort-Object { Get-Random })
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
           New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          
+          # Fix 2 - Add PasswordNeverExpires
+          Set-LocalUser -Name "RDP" -Password $securePass -PasswordNeverExpires $true
+          
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
 
@@ -68,73 +81,48 @@ jobs:
           Write-Host "Files extracted:"
           Get-ChildItem "C:\localtonet"
 
-          # Add to PATH
-          $env:PATH += ";C:\localtonet"
-
-          # Verify
-          if (Test-Path "C:\localtonet\localtonet.exe") {
-              Write-Host "LocaltoNet installed successfully"
-              & "C:\localtonet\localtonet.exe" --version
-          } else {
+          if (-not (Test-Path "C:\localtonet\localtonet.exe")) {
               Write-Error "localtonet.exe not found after extraction"
               exit 1
           }
+          Write-Host "LocaltoNet installed successfully"
 
       - name: Start LocaltoNet Tunnel
         shell: powershell
         run: |
-          # Authenticate and start tunnel in background
-          $process = Start-Process -FilePath "C:\localtonet\localtonet.exe" `
-            -ArgumentList "--authtoken ${{ secrets.LOCALTONET_TOKEN }}" `
+          # Fix 1 - Use exact SSH tunnel command format from LocaltoNet dashboard
+          # Format: ssh -p 223 TOKEN@SERVER -RREMOTE_PORT:127.0.0.1:3389
+          $tunnelCmd = "-p 223 ${{ secrets.LOCALTONET_TOKEN }}@${{ secrets.LOCALTONET_SERVER }} -R${{ secrets.LOCALTONET_REMOTE_PORT }}:127.0.0.1:3389 -o StrictHostKeyChecking=no -o ServerAliveInterval=30"
+
+          Write-Host "Starting tunnel..."
+
+          $process = Start-Process -FilePath "ssh" `
+            -ArgumentList $tunnelCmd `
             -WindowStyle Hidden `
             -RedirectStandardOutput "C:\ltn-log.txt" `
             -RedirectStandardError "C:\ltn-err.txt" `
             -PassThru
 
-          Write-Host "LocaltoNet PID: $($process.Id)"
+          Write-Host "Tunnel PID: $($process.Id)"
+          echo "LTN_PID=$($process.Id)" >> $env:GITHUB_ENV
 
-          $connected = $false
-          $retries = 0
-          $maxRetries = 30
+          # Fix 4 - Wait fixed 20 seconds then check if still running
+          Write-Host "Waiting 20 seconds for tunnel to establish..."
+          Start-Sleep -Seconds 20
 
-          while (-not $connected -and $retries -lt $maxRetries) {
-              Start-Sleep -Seconds 5
-              $retries++
-              Write-Host "Attempt $retries/$maxRetries - Waiting for tunnel..."
-
-              if ($process.HasExited) {
-                  Write-Host "--- STDOUT ---"
-                  if (Test-Path "C:\ltn-log.txt") { Get-Content "C:\ltn-log.txt" }
-                  Write-Host "--- STDERR ---"
-                  if (Test-Path "C:\ltn-err.txt") { Get-Content "C:\ltn-err.txt" }
-                  Write-Error "LocaltoNet exited unexpectedly"
-                  exit 1
-              }
-
-              $logFiles = @("C:\ltn-log.txt", "C:\ltn-err.txt")
-              foreach ($logFile in $logFiles) {
-                  if (Test-Path $logFile) {
-                      $log = Get-Content $logFile -Raw
-                      Write-Host "--- Log ---"
-                      Write-Host $log
-
-                      # Check for successful tunnel connection
-                      if ($log -match "tunnel|connected|started|listening|forwarding|ready") {
-                          $connected = $true
-                          Write-Host "Tunnel is active!"
-                          break
-                      }
-                  }
-              }
-          }
-
-          if (-not $connected) {
-              Write-Host "--- Final STDOUT ---"
+          if ($process.HasExited) {
+              Write-Host "--- STDOUT ---"
               if (Test-Path "C:\ltn-log.txt") { Get-Content "C:\ltn-log.txt" }
-              Write-Host "--- Final STDERR ---"
+              Write-Host "--- STDERR ---"
               if (Test-Path "C:\ltn-err.txt") { Get-Content "C:\ltn-err.txt" }
-              Write-Host "Warning: Could not confirm tunnel - it may still be running"
+              Write-Error "Tunnel exited unexpectedly with code $($process.ExitCode)"
+              exit 1
           }
+
+          Write-Host "--- Tunnel Log ---"
+          if (Test-Path "C:\ltn-log.txt") { Get-Content "C:\ltn-log.txt" }
+          if (Test-Path "C:\ltn-err.txt") { Get-Content "C:\ltn-err.txt" }
+          Write-Host "Tunnel is running successfully!"
 
       - name: Maintain Connection
         shell: powershell
@@ -149,5 +137,9 @@ jobs:
 
           while ($true) {
               Write-Host "[$(Get-Date)] RDP Active - Cancel workflow to terminate"
+              # Print tunnel status every 5 mins
+              if (Test-Path "C:\ltn-err.txt") {
+                  Get-Content "C:\ltn-err.txt" | Select-Object -Last 5
+              }
               Start-Sleep -Seconds 300
           }
