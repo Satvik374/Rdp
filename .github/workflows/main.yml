@@ -18,11 +18,12 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "SecurityLayer" -Value 0 -Force
 
-          netsh advfirewall firewall delete rule name="RDP-Cloudflare"
-          netsh advfirewall firewall add rule name="RDP-Cloudflare" `
+          netsh advfirewall firewall delete rule name="RDP-Playit"
+          netsh advfirewall firewall add rule name="RDP-Playit" `
             dir=in action=allow protocol=TCP localport=3389
 
           Restart-Service -Name TermService -Force
+          Write-Host "RDP configured successfully"
 
       - name: Create RDP User with Secure Password
         run: |
@@ -51,85 +52,117 @@ jobs:
               Write-Error "User creation failed"
               exit 1
           }
+          Write-Host "RDP user created successfully"
 
-      - name: Install Cloudflare Tunnel
+      - name: Install playit.gg
         run: |
-          $url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
-          Invoke-WebRequest -Uri $url -OutFile "C:\cloudflared.exe"
-          Write-Host "Cloudflared downloaded successfully"
-          & "C:\cloudflared.exe" --version
+          Write-Host "Downloading playit.gg agent..."
+          Invoke-WebRequest `
+            -Uri "https://github.com/playit-cloud/playit-agent/releases/latest/download/playit-windows-x86_64-signed.exe" `
+            -OutFile "C:\playit.exe"
+          Write-Host "playit.gg downloaded successfully"
 
-      - name: Establish Cloudflare Tunnel
+      - name: Configure playit.gg
         run: |
-          $process = Start-Process -FilePath "C:\cloudflared.exe" `
-            -ArgumentList "tunnel --url http://localhost:3389 --no-autoupdate" `
+          # Create playit config directory
+          New-Item -ItemType Directory -Force -Path "C:\playit-config" | Out-Null
+
+          # Write playit config file with secret key from GitHub secrets
+          $config = @"
+          last_update: 0
+          secret_key: ${{ secrets.PLAYIT_SECRET }}
+          "@
+          Set-Content -Path "C:\playit-config\config.toml" -Value $config
+          Write-Host "playit.gg config written"
+
+      - name: Start playit.gg Tunnel
+        run: |
+          $process = Start-Process -FilePath "C:\playit.exe" `
+            -ArgumentList "--config C:\playit-config\config.toml" `
             -WindowStyle Hidden `
-            -RedirectStandardOutput "C:\cf-log.txt" `
-            -RedirectStandardError "C:\cf-err.txt" `
+            -RedirectStandardOutput "C:\playit-log.txt" `
+            -RedirectStandardError "C:\playit-err.txt" `
             -PassThru
 
-          Write-Host "Cloudflared PID: $($process.Id)"
+          Write-Host "playit.gg PID: $($process.Id)"
 
           $tunnel = $null
           $retries = 0
-          $maxRetries = 30
+          $maxRetries = 40
 
           while (-not $tunnel -and $retries -lt $maxRetries) {
               Start-Sleep -Seconds 5
               $retries++
               Write-Host "Attempt $retries/$maxRetries - Waiting for tunnel..."
 
+              # Check if process crashed
               if ($process.HasExited) {
-                  Write-Host "--- CF STDOUT ---"
-                  if (Test-Path "C:\cf-log.txt") { Get-Content "C:\cf-log.txt" }
-                  Write-Host "--- CF STDERR ---"
-                  if (Test-Path "C:\cf-err.txt") { Get-Content "C:\cf-err.txt" }
-                  Write-Error "Cloudflared exited unexpectedly"
+                  Write-Host "--- playit STDOUT ---"
+                  if (Test-Path "C:\playit-log.txt") { Get-Content "C:\playit-log.txt" }
+                  Write-Host "--- playit STDERR ---"
+                  if (Test-Path "C:\playit-err.txt") { Get-Content "C:\playit-err.txt" }
+                  Write-Error "playit.gg exited unexpectedly with code $($process.ExitCode)"
                   exit 1
               }
 
-              if (Test-Path "C:\cf-err.txt") {
-                  $logContent = Get-Content "C:\cf-err.txt" -Raw
-                  if ($retries % 5 -eq 0) {
-                      Write-Host "--- CF Log Snapshot ---"
-                      Write-Host $logContent
-                  }
-                  if ($logContent -match "(https://[a-z0-9\-]+\.trycloudflare\.com)") {
-                      $tunnel = $matches[1]
-                      Write-Host "Tunnel found: $tunnel"
+              # Print logs every 5 attempts
+              if ($retries % 5 -eq 0) {
+                  Write-Host "--- playit log snapshot ---"
+                  if (Test-Path "C:\playit-log.txt") { Get-Content "C:\playit-log.txt" | Select-Object -Last 20 }
+                  if (Test-Path "C:\playit-err.txt") { Get-Content "C:\playit-err.txt" | Select-Object -Last 20 }
+              }
+
+              # Check logs for tunnel address
+              $logFiles = @("C:\playit-log.txt", "C:\playit-err.txt")
+              foreach ($logFile in $logFiles) {
+                  if (Test-Path $logFile) {
+                      $logContent = Get-Content $logFile -Raw
+                      # Match patterns like: 147.185.221.x:PORT or *.joinmc.link:PORT
+                      if ($logContent -match "(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+)") {
+                          $tunnel = $matches[1]
+                          Write-Host "Tunnel IP found: $tunnel"
+                          break
+                      }
+                      if ($logContent -match "([a-z0-9\-]+\.joinmc\.link:\d+)") {
+                          $tunnel = $matches[1]
+                          Write-Host "Tunnel hostname found: $tunnel"
+                          break
+                      }
+                      if ($logContent -match "([a-z0-9\-]+\.playit\.gg:\d+)") {
+                          $tunnel = $matches[1]
+                          Write-Host "Tunnel hostname found: $tunnel"
+                          break
+                      }
                   }
               }
           }
 
           if (-not $tunnel) {
-              Write-Host "--- Final CF STDOUT ---"
-              if (Test-Path "C:\cf-log.txt") { Get-Content "C:\cf-log.txt" }
-              Write-Host "--- Final CF STDERR ---"
-              if (Test-Path "C:\cf-err.txt") { Get-Content "C:\cf-err.txt" }
-              Write-Error "Cloudflare tunnel not established after $maxRetries attempts."
+              Write-Host "--- Final playit STDOUT ---"
+              if (Test-Path "C:\playit-log.txt") { Get-Content "C:\playit-log.txt" }
+              Write-Host "--- Final playit STDERR ---"
+              if (Test-Path "C:\playit-err.txt") { Get-Content "C:\playit-err.txt" }
+              Write-Error "playit.gg tunnel not established after $maxRetries attempts."
               exit 1
           }
 
-          echo "CF_TUNNEL=$tunnel" >> $env:GITHUB_ENV
+          $playitHost = $tunnel.Split(":")[0]
+          $playitPort = $tunnel.Split(":")[1]
 
-      - name: Install Cloudflare WARP / cloudflared on Runner for RDP Client
-        run: |
-          Write-Host "Tunnel is ready for external RDP access"
-          Write-Host "You will need cloudflared on YOUR machine to connect"
+          echo "PLAYIT_HOST=$playitHost" >> $env:GITHUB_ENV
+          echo "PLAYIT_PORT=$playitPort" >> $env:GITHUB_ENV
 
       - name: Maintain Connection
         run: |
           Write-Host "`n=== RDP ACCESS DETAILS ==="
-          Write-Host "Tunnel URL: $env:CF_TUNNEL"
-          Write-Host "Username:   RDP"
-          Write-Host "Password:   $env:RDP_PASSWORD"
+          Write-Host "Address:  $env:PLAYIT_HOST"
+          Write-Host "Port:     $env:PLAYIT_PORT"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $env:RDP_PASSWORD"
           Write-Host "=========================="
           Write-Host ""
-          Write-Host "To connect, run this on YOUR machine first:"
-          Write-Host "cloudflared access tcp --hostname $env:CF_TUNNEL --url localhost:13389"
-          Write-Host ""
-          Write-Host "Then open RDP client and connect to:"
-          Write-Host "localhost:13389"
+          Write-Host "Open RDP and connect to:"
+          Write-Host "$env:PLAYIT_HOST`:$env:PLAYIT_PORT"
           Write-Host "=========================="
 
           while ($true) {
