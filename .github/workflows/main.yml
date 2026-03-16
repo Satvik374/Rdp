@@ -11,7 +11,6 @@ jobs:
     steps:
       - name: Configure Core RDP Settings
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                              -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
@@ -19,25 +18,21 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "SecurityLayer" -Value 0 -Force
 
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          
-          # For testing, allow any incoming connection on port 3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+          netsh advfirewall firewall delete rule name="RDP-Ngrok"
+          netsh advfirewall firewall add rule name="RDP-Ngrok" `
             dir=in action=allow protocol=TCP localport=3389
 
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
           Restart-Service -Name TermService -Force
 
       - name: Create RDP User with Secure Password
         run: |
           Add-Type -AssemblyName System.Security
           $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
               Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126)) # Special characters
+                         [char[]](91..96) + [char[]](123..126))
           }
           $rawPassword = @()
           $rawPassword += $charSet.Upper | Get-Random -Count 4
@@ -49,51 +44,63 @@ jobs:
           New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-          
+
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
           if (-not (Get-LocalUser -Name "RDP")) {
               Write-Error "User creation failed"
               exit 1
           }
 
-      - name: Install Tailscale
+      - name: Install Ngrok
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          $ngrokUrl = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
+          $zipPath = "$env:TEMP\ngrok.zip"
+          $extractPath = "$env:TEMP\ngrok"
 
-      - name: Establish Tailscale Connection
+          Invoke-WebRequest -Uri $ngrokUrl -OutFile $zipPath
+          Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+          Move-Item "$extractPath\ngrok.exe" "C:\ngrok.exe" -Force
+          Remove-Item $zipPath -Force
+
+      - name: Establish Ngrok Tunnel
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          
-          # Wait for Tailscale to assign an IP
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
-          }
-          
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
+          # Authenticate ngrok with auth token
+          & "C:\ngrok.exe" config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
+
+          # Start ngrok tunnel for RDP in the background
+          Start-Process -FilePath "C:\ngrok.exe" `
+            -ArgumentList "tcp 3389" `
+            -WindowStyle Hidden
+
+          # Wait for tunnel to initialize
+          Start-Sleep -Seconds 8
+
+          # Retrieve the public tunnel address from the ngrok local API
+          $tunnelInfo = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels"
+          $tunnel = $tunnelInfo.tunnels[0].public_url
+
+          if (-not $tunnel) {
+              Write-Error "Ngrok tunnel not established. Exiting."
               exit 1
           }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-      
+
+          # Parse host and port from tcp://X.X.X.X:PORT
+          $parsed = $tunnel -replace "tcp://", ""
+          $ngrokHost = $parsed.Split(":")[0]
+          $ngrokPort = $parsed.Split(":")[1]
+
+          echo "NGROK_HOST=$ngrokHost" >> $env:GITHUB_ENV
+          echo "NGROK_PORT=$ngrokPort" >> $env:GITHUB_ENV
+
       - name: Verify RDP Accessibility
         run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          Write-Host "Ngrok Host: $env:NGROK_HOST"
+          Write-Host "Ngrok Port: $env:NGROK_PORT"
+
+          $testResult = Test-NetConnection -ComputerName $env:NGROK_HOST -Port $env:NGROK_PORT
           if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
+              Write-Error "TCP connection to RDP port failed via ngrok"
               exit 1
           }
           Write-Host "TCP connectivity successful!"
@@ -101,12 +108,13 @@ jobs:
       - name: Maintain Connection
         run: |
           Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Address: $env:NGROK_HOST"
+          Write-Host "Port:    $env:NGROK_PORT"
           Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "Password: $env:RDP_PASSWORD"
           Write-Host "==================`n"
-          
-          # Keep runner active indefinitely (or until manually cancelled)
+          Write-Host "Connect using: $env:NGROK_HOST`:$env:NGROK_PORT"
+
           while ($true) {
               Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
               Start-Sleep -Seconds 300
