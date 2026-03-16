@@ -56,16 +56,37 @@ jobs:
 
       - name: Install bore
         run: |
-          Write-Host "Downloading bore..."
-          Invoke-WebRequest `
-            -Uri "https://github.com/ekzhang/bore/releases/latest/download/bore-v0.5.0-x86_64-pc-windows-msvc.zip" `
-            -OutFile "C:\bore.zip"
+          Write-Host "Fetching latest bore release info..."
+          
+          # Get latest release info from GitHub API
+          $releaseInfo = Invoke-RestMethod -Uri "https://api.github.com/repos/ekzhang/bore/releases/latest"
+          $version = $releaseInfo.tag_name
+          Write-Host "Latest version: $version"
+
+          # Find the windows asset URL dynamically
+          $asset = $releaseInfo.assets | Where-Object { $_.name -like "*windows*x86_64*" }
+          
+          if (-not $asset) {
+              # Fallback - list all assets so we can see what's available
+              Write-Host "Available assets:"
+              $releaseInfo.assets | ForEach-Object { Write-Host $_.name }
+              Write-Error "Could not find Windows asset"
+              exit 1
+          }
+
+          $downloadUrl = $asset.browser_download_url
+          Write-Host "Downloading from: $downloadUrl"
+
+          Invoke-WebRequest -Uri $downloadUrl -OutFile "C:\bore.zip"
           Expand-Archive -Path "C:\bore.zip" -DestinationPath "C:\bore-extracted" -Force
-          Move-Item "C:\bore-extracted\bore.exe" "C:\bore.exe" -Force
+          
+          # Find the exe wherever it extracted
+          $boreExe = Get-ChildItem -Path "C:\bore-extracted" -Filter "bore.exe" -Recurse | Select-Object -First 1
+          Move-Item $boreExe.FullName "C:\bore.exe" -Force
           Remove-Item "C:\bore.zip" -Force
+          
           Write-Host "bore installed successfully"
           & "C:\bore.exe" --version
-
       - name: Start bore Tunnel
         run: |
           $process = Start-Process -FilePath "C:\bore.exe" `
