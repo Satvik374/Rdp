@@ -18,8 +18,8 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "SecurityLayer" -Value 0 -Force
 
-          netsh advfirewall firewall delete rule name="RDP-Ngrok"
-          netsh advfirewall firewall add rule name="RDP-Ngrok" `
+          netsh advfirewall firewall delete rule name="RDP-Serveo"
+          netsh advfirewall firewall add rule name="RDP-Serveo" `
             dir=in action=allow protocol=TCP localport=3389
 
           Restart-Service -Name TermService -Force
@@ -54,113 +54,80 @@ jobs:
           }
           Write-Host "RDP user created successfully"
 
-      - name: Install Ngrok
+      - name: Enable OpenSSH Client
         run: |
-          Write-Host "Downloading ngrok..."
-          $ngrokUrl = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
-          $zipPath = "$env:TEMP\ngrok.zip"
-          $extractPath = "$env:TEMP\ngrok"
+          Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
+          Write-Host "OpenSSH client ready"
 
-          Invoke-WebRequest -Uri $ngrokUrl -OutFile $zipPath
-          Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
-          Move-Item "$extractPath\ngrok.exe" "C:\ngrok.exe" -Force
-          Remove-Item $zipPath -Force
-
-          Write-Host "ngrok installed successfully"
-          & "C:\ngrok.exe" version
-
-      - name: Establish Ngrok Tunnel
+      - name: Start Serveo Tunnel
         run: |
-          # Authenticate ngrok with auth token
-          & "C:\ngrok.exe" config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
+          # Generate SSH key silently
+          ssh-keygen -t rsa -b 2048 -f "$env:USERPROFILE\.ssh\id_rsa" -N "" -q
 
-          # Start ngrok tunnel for RDP in the background
-          $process = Start-Process -FilePath "C:\ngrok.exe" `
-            -ArgumentList "tcp 3389 --log=stdout --log-level=debug" `
+          # Start SSH reverse tunnel to serveo.net
+          $process = Start-Process -FilePath "ssh" `
+            -ArgumentList "-o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -R 0:localhost:3389 serveo.net" `
             -WindowStyle Hidden `
-            -RedirectStandardOutput "C:\ngrok-log.txt" `
-            -RedirectStandardError "C:\ngrok-err.txt" `
+            -RedirectStandardOutput "C:\serveo-log.txt" `
+            -RedirectStandardError "C:\serveo-err.txt" `
             -PassThru
 
-          Write-Host "Ngrok PID: $($process.Id)"
+          Write-Host "SSH Tunnel PID: $($process.Id)"
 
-          $tunnel = $null
+          $port = $null
           $retries = 0
-          $maxRetries = 40
+          $maxRetries = 30
 
-          while (-not $tunnel -and $retries -lt $maxRetries) {
+          while (-not $port -and $retries -lt $maxRetries) {
               Start-Sleep -Seconds 5
               $retries++
-              Write-Host "Attempt $retries/$maxRetries - Checking ngrok API..."
+              Write-Host "Attempt $retries/$maxRetries - Waiting for tunnel..."
 
-              # Print logs every 5 attempts
-              if ($retries % 5 -eq 0) {
-                  Write-Host "--- ngrok log ---"
-                  if (Test-Path "C:\ngrok-log.txt") { Get-Content "C:\ngrok-log.txt" | Select-Object -Last 10 }
-                  if (Test-Path "C:\ngrok-err.txt") { Get-Content "C:\ngrok-err.txt" | Select-Object -Last 10 }
-              }
-
-              # Check if process crashed
               if ($process.HasExited) {
-                  Write-Host "--- ngrok STDOUT ---"
-                  if (Test-Path "C:\ngrok-log.txt") { Get-Content "C:\ngrok-log.txt" }
-                  Write-Host "--- ngrok STDERR ---"
-                  if (Test-Path "C:\ngrok-err.txt") { Get-Content "C:\ngrok-err.txt" }
-                  Write-Error "ngrok exited unexpectedly with code $($process.ExitCode)"
+                  Write-Host "--- Serveo STDOUT ---"
+                  if (Test-Path "C:\serveo-log.txt") { Get-Content "C:\serveo-log.txt" }
+                  Write-Host "--- Serveo STDERR ---"
+                  if (Test-Path "C:\serveo-err.txt") { Get-Content "C:\serveo-err.txt" }
+                  Write-Error "SSH tunnel exited unexpectedly"
                   exit 1
               }
 
-              try {
-                  $tunnelInfo = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -ErrorAction Stop
-                  if ($tunnelInfo.tunnels.Count -gt 0) {
-                      $tunnel = $tunnelInfo.tunnels[0].public_url
-                      Write-Host "Tunnel found: $tunnel"
-                  } else {
-                      Write-Host "API reachable but no tunnels yet..."
+              $logFiles = @("C:\serveo-log.txt", "C:\serveo-err.txt")
+              foreach ($logFile in $logFiles) {
+                  if (Test-Path $logFile) {
+                      $logContent = Get-Content $logFile -Raw
+                      Write-Host "--- Log ---"
+                      Write-Host $logContent
+
+                      # Serveo prints: Allocated port 12345 for remote forward
+                      if ($logContent -match "Allocated port (\d+) for remote forward") {
+                          $port = $matches[1]
+                          Write-Host "Port allocated: $port"
+                          break
+                      }
                   }
-              } catch {
-                  Write-Host "API not ready: $($_.Exception.Message)"
               }
           }
 
-          if (-not $tunnel) {
-              Write-Host "--- Final ngrok STDOUT ---"
-              if (Test-Path "C:\ngrok-log.txt") { Get-Content "C:\ngrok-log.txt" }
-              Write-Host "--- Final ngrok STDERR ---"
-              if (Test-Path "C:\ngrok-err.txt") { Get-Content "C:\ngrok-err.txt" }
-              Write-Error "Ngrok tunnel not established after $maxRetries attempts."
+          if (-not $port) {
+              Write-Host "--- Final STDOUT ---"
+              if (Test-Path "C:\serveo-log.txt") { Get-Content "C:\serveo-log.txt" }
+              Write-Host "--- Final STDERR ---"
+              if (Test-Path "C:\serveo-err.txt") { Get-Content "C:\serveo-err.txt" }
+              Write-Error "Serveo tunnel not established after $maxRetries attempts."
               exit 1
           }
 
-          # Parse host and port from tcp://X.X.X.X:PORT
-          $parsed = $tunnel -replace "tcp://", ""
-          $ngrokHost = $parsed.Split(":")[0]
-          $ngrokPort = $parsed.Split(":")[1]
-
-          Write-Host "Tunnel established: $tunnel"
-          echo "NGROK_HOST=$ngrokHost" >> $env:GITHUB_ENV
-          echo "NGROK_PORT=$ngrokPort" >> $env:GITHUB_ENV
-
-      - name: Verify RDP Accessibility
-        run: |
-          Write-Host "Ngrok Host: $env:NGROK_HOST"
-          Write-Host "Ngrok Port: $env:NGROK_PORT"
-
-          $testResult = Test-NetConnection -ComputerName $env:NGROK_HOST -Port $env:NGROK_PORT
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port failed via ngrok"
-              exit 1
-          }
-          Write-Host "TCP connectivity successful!"
+          echo "SERVEO_PORT=$port" >> $env:GITHUB_ENV
 
       - name: Maintain Connection
         run: |
           Write-Host "`n=== RDP ACCESS DETAILS ==="
-          Write-Host "Address:  $env:NGROK_HOST"
-          Write-Host "Port:     $env:NGROK_PORT"
+          Write-Host "Address:  serveo.net"
+          Write-Host "Port:     $env:SERVEO_PORT"
           Write-Host "Username: RDP"
           Write-Host "Password: $env:RDP_PASSWORD"
-          Write-Host "Connect:  $env:NGROK_HOST`:$env:NGROK_PORT"
+          Write-Host "Connect:  serveo.net:$env:SERVEO_PORT"
           Write-Host "=========================="
 
           while ($true) {
